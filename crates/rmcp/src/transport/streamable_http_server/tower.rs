@@ -11,14 +11,15 @@ use tokio_util::sync::CancellationToken;
 use super::session::SessionManager;
 use crate::{
     RoleServer,
-    model::{ClientJsonRpcMessage, ClientRequest, GetExtensions},
+    model::{ClientJsonRpcMessage, ClientRequest, GetExtensions, ProtocolVersion},
     serve_server,
     service::serve_directly,
     transport::{
         OneshotTransport, TransportAdapterIdentity,
         common::{
             http_header::{
-                EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID, HEADER_SESSION_ID, JSON_MIME_TYPE,
+                EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID, HEADER_MCP_PROTOCOL_VERSION,
+                HEADER_SESSION_ID, JSON_MIME_TYPE,
             },
             server_side_http::{
                 BoxResponse, ServerSseMessage, accepted_response, expect_json,
@@ -55,17 +56,127 @@ impl Default for StreamableHttpServerConfig {
     }
 }
 
-/// # Streamable Http Server
+#[expect(
+    clippy::result_large_err,
+    reason = "BoxResponse is intentionally large; matches other handlers in this file"
+)]
+/// Validates the `MCP-Protocol-Version` header on incoming HTTP requests.
 ///
-/// ## Extract information from raw http request
+/// Per the MCP 2025-06-18 spec:
+/// - If the header is present but contains an unsupported version, return 400 Bad Request.
+/// - If the header is absent, assume `2025-03-26` for backwards compatibility (no error).
+fn validate_protocol_version_header(headers: &http::HeaderMap) -> Result<(), BoxResponse> {
+    if let Some(value) = headers.get(HEADER_MCP_PROTOCOL_VERSION) {
+        let version_str = value.to_str().map_err(|_| {
+            Response::builder()
+                .status(http::StatusCode::BAD_REQUEST)
+                .body(
+                    Full::new(Bytes::from(
+                        "Bad Request: Invalid MCP-Protocol-Version header encoding",
+                    ))
+                    .boxed(),
+                )
+                .expect("valid response")
+        })?;
+        let is_known = ProtocolVersion::KNOWN_VERSIONS
+            .iter()
+            .any(|v| v.as_str() == version_str);
+        if !is_known {
+            return Err(Response::builder()
+                .status(http::StatusCode::BAD_REQUEST)
+                .body(
+                    Full::new(Bytes::from(format!(
+                        "Bad Request: Unsupported MCP-Protocol-Version: {version_str}"
+                    )))
+                    .boxed(),
+                )
+                .expect("valid response"));
+        }
+    }
+    Ok(())
+}
+
+/// # Streamable HTTP server
 ///
-/// The http service will consume the request body, however the rest part will be remain and injected into [`crate::model::Extensions`],
-/// which you can get from [`crate::service::RequestContext`].
+/// An HTTP service that implements the
+/// [Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http)
+/// for MCP servers.
+///
+/// ## Session management
+///
+/// When [`StreamableHttpServerConfig::stateful_mode`] is `true` (the default),
+/// the server creates a session for each client that sends an `initialize`
+/// request. The session ID is returned in the `Mcp-Session-Id` response header
+/// and the client must include it on all subsequent requests.
+///
+/// Two tool calls carrying the same `Mcp-Session-Id` come from the same logical
+/// session (typically one conversation in an LLM client). Different session IDs
+/// mean different sessions.
+///
+/// The [`SessionManager`] trait controls how sessions are stored and routed:
+///
+/// * [`LocalSessionManager`](super::session::local::LocalSessionManager) —
+///   in-memory session store (default).
+/// * [`NeverSessionManager`](super::session::never::NeverSessionManager) —
+///   disables sessions entirely (stateless mode).
+///
+/// ## Accessing HTTP request data from tool handlers
+///
+/// The service consumes the request body but injects the remaining
+/// [`http::request::Parts`] into [`crate::model::Extensions`], which is
+/// accessible through [`crate::service::RequestContext`].
+///
+/// ### Reading the raw HTTP parts
+///
 /// ```rust
 /// use rmcp::handler::server::tool::Extension;
 /// use http::request::Parts;
 /// async fn my_tool(Extension(parts): Extension<Parts>) {
 ///     tracing::info!("http parts:{parts:?}")
+/// }
+/// ```
+///
+/// ### Reading the session ID inside a tool handler
+///
+/// ```rust,ignore
+/// use rmcp::handler::server::tool::Extension;
+/// use rmcp::service::RequestContext;
+/// use rmcp::model::RoleServer;
+///
+/// #[tool(description = "session-aware tool")]
+/// async fn my_tool(
+///     &self,
+///     Extension(parts): Extension<http::request::Parts>,
+/// ) -> Result<CallToolResult, rmcp::ErrorData> {
+///     if let Some(session_id) = parts.headers.get("mcp-session-id") {
+///         tracing::info!(?session_id, "called from session");
+///     }
+///     // ...
+///     # todo!()
+/// }
+/// ```
+///
+/// ### Accessing custom axum/tower extension state
+///
+/// State added via axum's `Extension` layer is available inside
+/// `Parts.extensions`:
+///
+/// ```rust,ignore
+/// use rmcp::service::RequestContext;
+/// use rmcp::model::RoleServer;
+///
+/// #[derive(Clone)]
+/// struct AppState { /* ... */ }
+///
+/// #[tool(description = "example")]
+/// async fn my_tool(
+///     &self,
+///     ctx: RequestContext<RoleServer>,
+/// ) -> Result<CallToolResult, rmcp::ErrorData> {
+///     let parts = ctx.extensions.get::<http::request::Parts>().unwrap();
+///     let state = parts.extensions.get::<AppState>().unwrap();
+///     // use state...
+///     # todo!()
 /// }
 /// ```
 pub struct StreamableHttpService<S, M = super::session::local::LocalSessionManager> {
@@ -188,10 +299,10 @@ where
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_owned().into());
         let Some(session_id) = session_id else {
-            // unauthorized
+            // MCP spec: servers that require a session ID SHOULD respond with 400 Bad Request
             return Ok(Response::builder()
-                .status(http::StatusCode::UNAUTHORIZED)
-                .body(Full::new(Bytes::from("Unauthorized: Session ID is required")).boxed())
+                .status(http::StatusCode::BAD_REQUEST)
+                .body(Full::new(Bytes::from("Bad Request: Session ID is required")).boxed())
                 .expect("valid response"));
         };
         // check if session exists
@@ -201,12 +312,14 @@ where
             .await
             .map_err(internal_error_response("check session"))?;
         if !has_session {
-            // unauthorized
+            // MCP spec: server MUST respond with 404 Not Found for terminated/unknown sessions
             return Ok(Response::builder()
-                .status(http::StatusCode::UNAUTHORIZED)
-                .body(Full::new(Bytes::from("Unauthorized: Session not found")).boxed())
+                .status(http::StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::from("Not Found: Session not found")).boxed())
                 .expect("valid response"));
         }
+        // Validate MCP-Protocol-Version header (per 2025-06-18 spec)
+        validate_protocol_version_header(request.headers())?;
         // check if last event id is provided
         let last_event_id = request
             .headers()
@@ -313,12 +426,15 @@ where
                     .await
                     .map_err(internal_error_response("check session"))?;
                 if !has_session {
-                    // unauthorized
+                    // MCP spec: server MUST respond with 404 Not Found for terminated/unknown sessions
                     return Ok(Response::builder()
-                        .status(http::StatusCode::UNAUTHORIZED)
-                        .body(Full::new(Bytes::from("Unauthorized: Session not found")).boxed())
+                        .status(http::StatusCode::NOT_FOUND)
+                        .body(Full::new(Bytes::from("Not Found: Session not found")).boxed())
                         .expect("valid response"));
                 }
+
+                // Validate MCP-Protocol-Version header (per 2025-06-18 spec)
+                validate_protocol_version_header(&part.headers)?;
 
                 // inject request part to extensions
                 match &mut message {
@@ -455,6 +571,14 @@ where
                 Ok(response)
             }
         } else {
+            // Stateless mode: validate MCP-Protocol-Version on non-init requests
+            let is_init = matches!(
+                &message,
+                ClientJsonRpcMessage::Request(req) if matches!(req.request, ClientRequest::InitializeRequest(_))
+            );
+            if !is_init {
+                validate_protocol_version_header(&part.headers)?;
+            }
             let service = self
                 .get_service()
                 .map_err(internal_error_response("get service"))?;
@@ -505,12 +629,14 @@ where
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_owned().into());
         let Some(session_id) = session_id else {
-            // unauthorized
+            // MCP spec: servers that require a session ID SHOULD respond with 400 Bad Request
             return Ok(Response::builder()
-                .status(http::StatusCode::UNAUTHORIZED)
-                .body(Full::new(Bytes::from("Unauthorized: Session ID is required")).boxed())
+                .status(http::StatusCode::BAD_REQUEST)
+                .body(Full::new(Bytes::from("Bad Request: Session ID is required")).boxed())
                 .expect("valid response"));
         };
+        // Validate MCP-Protocol-Version header (per 2025-06-18 spec)
+        validate_protocol_version_header(request.headers())?;
         // close session
         self.session_manager
             .close_session(&session_id)

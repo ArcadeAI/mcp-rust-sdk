@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use async_trait::async_trait;
 use oauth2::{
@@ -61,6 +65,8 @@ pub struct StoredCredentials {
     pub token_response: Option<OAuthTokenResponse>,
     #[serde(default)]
     pub granted_scopes: Vec<String>,
+    #[serde(default)]
+    pub token_received_at: Option<u64>,
 }
 
 /// Trait for storing and retrieving OAuth2 credentials
@@ -969,44 +975,74 @@ impl AuthorizationManager {
             client_id,
             token_response: Some(token_result.clone()),
             granted_scopes,
+            token_received_at: Some(Self::now_epoch_secs()),
         };
         self.credential_store.save(stored).await?;
 
         Ok(token_result)
     }
 
-    /// get access token from local credential store.
-    /// if expired, refresh it automatically when a refresh token is available.
-    /// when the access token has expired and no refresh token is available, it returns
-    /// [`AuthError::AuthorizationRequired`] so the caller can re-authenticate.
+    fn now_epoch_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    /// Proactive refresh buffer: refresh tokens this many seconds before they expire
+    /// to avoid races between token retrieval and the actual HTTP request.
+    const REFRESH_BUFFER_SECS: u64 = 30;
+
+    /// Get access token from local credential store.
+    /// If expired, refresh it automatically when a refresh token is available.
+    /// When the access token has expired and no refresh token is available (or
+    /// the refresh itself fails), returns [`AuthError::AuthorizationRequired`]
+    /// so the caller can re-authenticate.
     pub async fn get_access_token(&self) -> Result<String, AuthError> {
         let stored = self.credential_store.load().await?;
-        let credentials = stored.and_then(|s| s.token_response);
+        let Some(stored_creds) = stored else {
+            return Err(AuthError::AuthorizationRequired);
+        };
+        let Some(creds) = stored_creds.token_response.as_ref() else {
+            return Err(AuthError::AuthorizationRequired);
+        };
 
-        if let Some(creds) = credentials.as_ref() {
-            if let Some(expires_in) = creds.expires_in() {
-                if expires_in <= Duration::from_secs(0) {
-                    if creds.refresh_token().is_some() {
-                        tracing::info!("Access token expired, attempting refresh.");
-                        match self.refresh_token().await {
-                            Ok(new_creds) => {
-                                tracing::info!("Refreshed access token.");
-                                return Ok(new_creds.access_token().secret().to_string());
-                            }
-                            Err(e) => {
-                                tracing::warn!("Token refresh failed: {e}");
-                            }
-                        }
-                    } else {
-                        tracing::info!("Access token expired and no refresh token available.");
-                    }
-                    return Err(AuthError::AuthorizationRequired);
-                }
+        if let (Some(expires_in), Some(received_at)) =
+            (creds.expires_in(), stored_creds.token_received_at)
+        {
+            let elapsed = Self::now_epoch_secs().saturating_sub(received_at);
+            let remaining = expires_in.as_secs().saturating_sub(elapsed);
+
+            if remaining < Self::REFRESH_BUFFER_SECS {
+                tracing::info!(
+                    remaining_secs = remaining,
+                    "Access token expired or nearly expired, refreshing."
+                );
+                return self.try_refresh_or_reauth().await;
             }
+        }
 
-            Ok(creds.access_token().secret().to_string())
-        } else {
-            Err(AuthError::AuthorizationRequired)
+        // When expiry info is unavailable (e.g., credentials stored before
+        // token_received_at was tracked), skip the expiry check and return
+        // the token as-is.
+        Ok(creds.access_token().secret().to_string())
+    }
+
+    /// Attempt to refresh the token. If refresh fails because there is no
+    /// refresh token or the server rejected it, return `AuthorizationRequired`
+    /// so the caller can re-prompt the user. Infrastructure errors (e.g. store
+    /// I/O failures, misconfigured client) are propagated as-is.
+    async fn try_refresh_or_reauth(&self) -> Result<String, AuthError> {
+        match self.refresh_token().await {
+            Ok(new_creds) => {
+                tracing::info!("Refreshed access token.");
+                Ok(new_creds.access_token().secret().to_string())
+            }
+            Err(e @ (AuthError::AuthorizationRequired | AuthError::TokenRefreshFailed(_))) => {
+                tracing::warn!(error = %e, "Token refresh not possible, re-authorization required.");
+                Err(AuthError::AuthorizationRequired)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -1027,6 +1063,7 @@ impl AuthorizationManager {
         let refresh_token = current_credentials.refresh_token().ok_or_else(|| {
             AuthError::TokenRefreshFailed("No refresh token available".to_string())
         })?;
+        debug!("refresh token present, attempting refresh");
 
         let token_result = oauth_client
             .exchange_refresh_token(&RefreshToken::new(refresh_token.secret().to_string()))
@@ -1034,10 +1071,10 @@ impl AuthorizationManager {
             .await
             .map_err(|e| AuthError::TokenRefreshFailed(e.to_string()))?;
 
-        let granted_scopes: Vec<String> = token_result
-            .scopes()
-            .map(|scopes| scopes.iter().map(|s| s.to_string()).collect())
-            .unwrap_or_else(|| self.current_scopes.blocking_read().clone());
+        let granted_scopes: Vec<String> = match token_result.scopes() {
+            Some(scopes) => scopes.iter().map(|s| s.to_string()).collect(),
+            None => self.current_scopes.read().await.clone(),
+        };
 
         *self.current_scopes.write().await = granted_scopes.clone();
 
@@ -1046,6 +1083,7 @@ impl AuthorizationManager {
             client_id,
             token_response: Some(token_result.clone()),
             granted_scopes,
+            token_received_at: Some(Self::now_epoch_secs()),
         };
         self.credential_store.save(stored).await?;
 
@@ -1653,6 +1691,7 @@ impl OAuthState {
                 client_id: client_id.to_string(),
                 token_response: Some(credentials),
                 granted_scopes,
+                token_received_at: Some(AuthorizationManager::now_epoch_secs()),
             };
             manager.credential_store.save(stored).await?;
 
@@ -1860,7 +1899,7 @@ impl OAuthState {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc, time::Duration};
+    use std::{collections::HashMap, sync::Arc};
 
     use oauth2::{AuthType, CsrfToken, PkceCodeVerifier};
     use url::Url;
@@ -2631,117 +2670,6 @@ mod tests {
         assert_eq!(result.len(), 2);
     }
 
-    // -- SEP-2207: get_access_token refresh behavior --
-
-    fn make_token_response(
-        access_token: &str,
-        expires_in: Option<Duration>,
-        refresh_token: Option<&str>,
-    ) -> super::OAuthTokenResponse {
-        use oauth2::{AccessToken, basic::BasicTokenType};
-        let mut resp = super::OAuthTokenResponse::new(
-            AccessToken::new(access_token.to_string()),
-            BasicTokenType::Bearer,
-            oauth2::EmptyExtraTokenFields {},
-        );
-        resp.set_expires_in(expires_in.as_ref());
-        if let Some(rt) = refresh_token {
-            resp.set_refresh_token(Some(oauth2::RefreshToken::new(rt.to_string())));
-        }
-        resp
-    }
-
-    #[tokio::test]
-    async fn get_access_token_returns_token_when_not_expired() {
-        let mgr = AuthorizationManager::new("http://localhost").await.unwrap();
-        let creds = super::StoredCredentials {
-            client_id: "test".to_string(),
-            token_response: Some(make_token_response(
-                "valid-token",
-                Some(Duration::from_secs(3600)),
-                None,
-            )),
-            granted_scopes: vec![],
-        };
-        mgr.credential_store.save(creds).await.unwrap();
-
-        let token = mgr.get_access_token().await.unwrap();
-        assert_eq!(token, "valid-token");
-    }
-
-    #[tokio::test]
-    async fn get_access_token_returns_token_when_no_expires_in() {
-        let mgr = AuthorizationManager::new("http://localhost").await.unwrap();
-        let creds = super::StoredCredentials {
-            client_id: "test".to_string(),
-            token_response: Some(make_token_response(
-                "no-expiry-token",
-                None,
-                Some("refresh-tok"),
-            )),
-            granted_scopes: vec![],
-        };
-        mgr.credential_store.save(creds).await.unwrap();
-
-        let token = mgr.get_access_token().await.unwrap();
-        assert_eq!(token, "no-expiry-token");
-    }
-
-    #[tokio::test]
-    async fn get_access_token_requires_reauth_when_expired_without_refresh_token() {
-        let mgr = AuthorizationManager::new("http://localhost").await.unwrap();
-        let creds = super::StoredCredentials {
-            client_id: "test".to_string(),
-            token_response: Some(make_token_response(
-                "expired-token",
-                Some(Duration::from_secs(0)),
-                None,
-            )),
-            granted_scopes: vec![],
-        };
-        mgr.credential_store.save(creds).await.unwrap();
-
-        let err = mgr.get_access_token().await.unwrap_err();
-        assert!(
-            matches!(err, AuthError::AuthorizationRequired),
-            "expected AuthorizationRequired, got: {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn get_access_token_requires_reauth_when_refresh_fails() {
-        let mgr = AuthorizationManager::new("http://localhost").await.unwrap();
-        let creds = super::StoredCredentials {
-            client_id: "test".to_string(),
-            token_response: Some(make_token_response(
-                "expired-token",
-                Some(Duration::from_secs(0)),
-                Some("bad-refresh"),
-            )),
-            granted_scopes: vec![],
-        };
-        mgr.credential_store.save(creds).await.unwrap();
-
-        // No oauth_client configured, so refresh_token() will fail with InternalError.
-        // get_access_token should catch that and return AuthorizationRequired.
-        let err = mgr.get_access_token().await.unwrap_err();
-        assert!(
-            matches!(err, AuthError::AuthorizationRequired),
-            "expected AuthorizationRequired on refresh failure, got: {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn get_access_token_requires_reauth_when_no_credentials() {
-        let mgr = AuthorizationManager::new("http://localhost").await.unwrap();
-
-        let err = mgr.get_access_token().await.unwrap_err();
-        assert!(
-            matches!(err, AuthError::AuthorizationRequired),
-            "expected AuthorizationRequired with no credentials, got: {err:?}"
-        );
-    }
-
     // -- SEP-2207: offline_access --
 
     #[tokio::test]
@@ -2918,5 +2846,117 @@ mod tests {
 
         *manager.scope_upgrade_attempts.write().await = 1;
         assert!(manager.can_attempt_scope_upgrade().await);
+    }
+
+    // -- get_access_token --
+
+    use super::{OAuthTokenResponse, StoredCredentials};
+
+    fn make_token_response(access_token: &str, expires_in_secs: Option<u64>) -> OAuthTokenResponse {
+        use oauth2::{AccessToken, EmptyExtraTokenFields, basic::BasicTokenType};
+        let mut resp = OAuthTokenResponse::new(
+            AccessToken::new(access_token.to_string()),
+            BasicTokenType::Bearer,
+            EmptyExtraTokenFields {},
+        );
+        if let Some(secs) = expires_in_secs {
+            resp.set_expires_in(Some(&std::time::Duration::from_secs(secs)));
+        }
+        resp
+    }
+
+    #[tokio::test]
+    async fn get_access_token_returns_error_when_no_credentials() {
+        let manager = AuthorizationManager::new("http://localhost").await.unwrap();
+        let err = manager.get_access_token().await.unwrap_err();
+        assert!(matches!(err, AuthError::AuthorizationRequired));
+    }
+
+    #[tokio::test]
+    async fn get_access_token_returns_token_when_not_expired() {
+        let manager = AuthorizationManager::new("http://localhost").await.unwrap();
+        let stored = StoredCredentials {
+            client_id: "test".to_string(),
+            token_response: Some(make_token_response("my-access-token", Some(3600))),
+            granted_scopes: vec![],
+            token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+        };
+        manager.credential_store.save(stored).await.unwrap();
+
+        let token = manager.get_access_token().await.unwrap();
+        assert_eq!(token, "my-access-token");
+    }
+
+    #[tokio::test]
+    async fn get_access_token_requires_reauth_when_expired_and_no_refresh_token() {
+        let mut manager = manager_with_metadata(None).await;
+        manager.configure_client(test_client_config()).unwrap();
+
+        let stored = StoredCredentials {
+            client_id: "my-client".to_string(),
+            token_response: Some(make_token_response("stale-token", Some(3600))),
+            granted_scopes: vec![],
+            token_received_at: Some(AuthorizationManager::now_epoch_secs() - 7200),
+        };
+        manager.credential_store.save(stored).await.unwrap();
+
+        let err = manager.get_access_token().await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::AuthorizationRequired),
+            "expected AuthorizationRequired when token is expired and refresh is impossible, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_access_token_returns_token_without_expiry_info() {
+        let manager = AuthorizationManager::new("http://localhost").await.unwrap();
+        let stored = StoredCredentials {
+            client_id: "test".to_string(),
+            token_response: Some(make_token_response("no-expiry-token", None)),
+            granted_scopes: vec![],
+            token_received_at: None,
+        };
+        manager.credential_store.save(stored).await.unwrap();
+
+        let token = manager.get_access_token().await.unwrap();
+        assert_eq!(token, "no-expiry-token");
+    }
+
+    #[tokio::test]
+    async fn get_access_token_requires_reauth_when_within_refresh_buffer() {
+        let mut manager = manager_with_metadata(None).await;
+        manager.configure_client(test_client_config()).unwrap();
+
+        let stored = StoredCredentials {
+            client_id: "my-client".to_string(),
+            token_response: Some(make_token_response("almost-expired", Some(3600))),
+            granted_scopes: vec![],
+            token_received_at: Some(AuthorizationManager::now_epoch_secs() - 3590),
+        };
+        manager.credential_store.save(stored).await.unwrap();
+
+        let err = manager.get_access_token().await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::AuthorizationRequired),
+            "expected AuthorizationRequired when token is within refresh buffer, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_access_token_propagates_internal_errors() {
+        let manager = AuthorizationManager::new("http://localhost").await.unwrap();
+        let stored = StoredCredentials {
+            client_id: "test".to_string(),
+            token_response: Some(make_token_response("stale-token", Some(3600))),
+            granted_scopes: vec![],
+            token_received_at: Some(AuthorizationManager::now_epoch_secs() - 7200),
+        };
+        manager.credential_store.save(stored).await.unwrap();
+
+        let err = manager.get_access_token().await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::InternalError(_)),
+            "expected InternalError when OAuth client is not configured, got: {err:?}"
+        );
     }
 }
